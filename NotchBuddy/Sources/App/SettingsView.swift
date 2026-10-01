@@ -10,6 +10,8 @@ struct SettingsView: View {
     @State private var showDiff: Bool = false
     @State private var pendingHookJSON: String = ""
     @State private var hookNeedsUpdate: Bool = HookServer.hooksNeedUpdate()
+    @State private var showCodexDiff: Bool = false
+    @State private var pendingCodexJSON: String = ""
 
     // Integration keys
     @State private var resendKey: String    = KeychainStore.shared.get("resend-api-key")  ?? ""
@@ -118,6 +120,50 @@ struct SettingsView: View {
                             }
                         }
                         #endif
+                    }
+                    .padding(6)
+                }
+
+                // MARK: Codex Hooks
+                GroupBox("Codex Hooks") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        #if APPSTORE
+                        Text("Codex hooks are installed from the GitHub build for now.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                        #else
+                        Text("hooks.json : \(HookServer.codexHooksURL.path)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.secondary)
+                        HStack(spacing: 10) {
+                            Button("Install hooks") { installCodexHooks() }
+                                .buttonStyle(.borderedProminent)
+                            Button("Uninstall") { uninstallCodexHooks() }
+                                .buttonStyle(.bordered)
+                        }
+                        #endif
+
+                        Text("Codex asks you to trust new hooks once — run /hooks in Codex, review and trust them.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+
+                        if showCodexDiff {
+                            ScrollView {
+                                Text(pendingCodexJSON)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(height: 140)
+                            .background(Color(NSColor.textBackgroundColor))
+                            .cornerRadius(6)
+
+                            HStack {
+                                Button("Confirm & write") { confirmInstallCodex() }
+                                    .buttonStyle(.borderedProminent)
+                                Button("Cancel") { showCodexDiff = false; pendingCodexJSON = "" }
+                                    .buttonStyle(.bordered)
+                            }
+                        }
                     }
                     .padding(6)
                 }
@@ -406,6 +452,7 @@ struct SettingsView: View {
             statusMessage = "❌ \(error.localizedDescription)"
         }
     }
+
     #endif
 
     private func installHooks() {
@@ -434,6 +481,38 @@ struct SettingsView: View {
         do {
             try HookServer.shared.uninstallClaudeHooks()
             statusMessage = "✓ Hooks removed."
+        } catch {
+            statusMessage = "❌ \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Codex hooks (dev build: ~/.codex is reachable directly)
+
+    private func installCodexHooks() {
+        do {
+            pendingCodexJSON = try HookServer.shared.previewCodexHooks()
+            showCodexDiff = true
+            statusMessage = "Review the hooks.json below before confirming."
+        } catch {
+            statusMessage = "❌ \(error.localizedDescription)"
+        }
+    }
+
+    private func confirmInstallCodex() {
+        do {
+            try HookServer.shared.writeCodexHooks()
+            showCodexDiff = false
+            pendingCodexJSON = ""
+            statusMessage = "✓ Codex hooks installed — run /hooks in Codex to trust them."
+        } catch {
+            statusMessage = "❌ Write error: \(error.localizedDescription)"
+        }
+    }
+
+    private func uninstallCodexHooks() {
+        do {
+            try HookServer.shared.uninstallCodexHooks()
+            statusMessage = "✓ Codex hooks removed."
         } catch {
             statusMessage = "❌ \(error.localizedDescription)"
         }
