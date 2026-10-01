@@ -17,6 +17,12 @@ Check resting island dimensions on screens with and without a notch:
 bash scripts/test-screen-geometry.sh
 ```
 
+Check default-screen selection and disconnected-display fallback:
+
+```bash
+bash scripts/test-screen-selection.sh
+```
+
 ## Good first contributions
 
 - A new integration (a poller + a pill + a detail card). Look at `StripePoller.swift` for a compact example.
