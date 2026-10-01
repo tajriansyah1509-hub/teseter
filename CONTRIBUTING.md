@@ -17,6 +17,12 @@ Check resting island dimensions on screens with and without a notch:
 bash scripts/test-screen-geometry.sh
 ```
 
+Check native fullscreen state and display matching:
+
+```bash
+bash scripts/test-fullscreen-visibility.sh
+```
+
 ## Good first contributions
 
 - A new integration (a poller + a pill + a detail card). Look at `StripePoller.swift` for a compact example.

@@ -15,6 +15,11 @@ final class IslandWindowController: NSWindowController {
     private var frameTimer: Timer?
     private var keyMonitor: Any?
     private var viewSubscription: AnyCancellable?
+    private var fullscreenRefresh: DispatchWorkItem?
+    private var fullscreenTargetHidden = false
+    private var fullscreenTransition = 0
+    private var fullscreenNotifications: AnyCancellable?
+    private var fullscreenSetting: AnyCancellable?
 
     // Confused recovery timer (set by handleDizzy)
     private var confusedRecoveryTimer: DispatchWorkItem?
@@ -137,6 +142,7 @@ final class IslandWindowController: NSWindowController {
         startPolling()
         startKeyMonitor()
         wireFSM()
+        observeFullscreen()
 
         // Make panel key whenever the prompt/chat view becomes active
         // (nonactivatingPanel never auto-becomes key, but TextField needs it)
@@ -148,6 +154,72 @@ final class IslandWindowController: NSWindowController {
                     self.islandPanel.makeKey()
                 }
             }
+    }
+
+    // Space and activation events can precede the end of the window animation.
+    // Hide during a Space transition, then restore only after its windows settle.
+    // No continuous fullscreen polling.
+    private func observeFullscreen() {
+        let center = NSWorkspace.shared.notificationCenter
+        fullscreenNotifications = center.publisher(for: NSWorkspace.activeSpaceDidChangeNotification)
+            .merge(with: center.publisher(for: NSWorkspace.didActivateApplicationNotification))
+            .merge(with: NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification))
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                self?.refreshFullscreenVisibility(spaceChanged: notification.name == NSWorkspace.activeSpaceDidChangeNotification)
+            }
+        fullscreenSetting = state.$hideInFullscreen
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshFullscreenVisibility() }
+    }
+
+    private func refreshFullscreenVisibility(spaceChanged: Bool = false) {
+        fullscreenRefresh?.cancel()
+        guard state.hideInFullscreen else {
+            setFullscreenHidden(false)
+            return
+        }
+        if spaceChanged || FullscreenVisibility.shouldHide(on: islandPanel.screen) {
+            setFullscreenHidden(true)
+        }
+        let refresh = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.setFullscreenHidden(self.state.hideInFullscreen && FullscreenVisibility.shouldHide(on: self.islandPanel.screen))
+        }
+        fullscreenRefresh = refresh
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(900), execute: refresh)
+    }
+
+    private func setFullscreenHidden(_ hidden: Bool) {
+        guard let panel = window as? IslandPanel, hidden != fullscreenTargetHidden else { return }
+        fullscreenTargetHidden = hidden
+        fullscreenTransition += 1
+        let transition = fullscreenTransition
+        let duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.0 : 0.18
+        if hidden {
+            panel.resignKey()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = duration
+                panel.animator().alphaValue = 0
+            } completionHandler: { [weak self] in
+                Task { @MainActor in
+                    guard let self, self.fullscreenTargetHidden, self.fullscreenTransition == transition else { return }
+                    self.islandPanel.orderOut(nil)
+                    self.state.isIslandSuppressed = true
+                }
+            }
+        } else {
+            state.isIslandSuppressed = false
+            if !panel.isVisible {
+                panel.alphaValue = 0
+                panel.orderFrontRegardless()
+                panel.contentView?.layoutSubtreeIfNeeded()
+            }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = duration
+                panel.animator().alphaValue = 1
+            }
+        }
     }
 
     // MARK: - FSM wiring
@@ -204,7 +276,7 @@ final class IslandWindowController: NSWindowController {
     }
 
     private func pollFrame() {
-        guard let panel = window as? IslandPanel else { return }
+        guard let panel = window as? IslandPanel, !state.isIslandSuppressed else { return }
 
         let mouse = NSEvent.mouseLocation
 
