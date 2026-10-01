@@ -6,6 +6,9 @@ mod hooks;
 mod integrations;
 mod island;
 mod log;
+mod opencode;
+mod opencode_chat;
+mod opencode_server;
 mod pipe;
 mod secrets;
 mod settings;
@@ -25,6 +28,7 @@ use claude::{Chat, ChatContext, ChatReply};
 use files::DroppedFile;
 use hooks::{HookPreview, HookStatus};
 use island::{PollGate, ScreenInfo};
+use opencode::{OpencodePreview, OpencodeStatus};
 use pipe::Pending;
 use settings::Settings;
 
@@ -50,6 +54,10 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
     let mut settings = shared.settings.lock().unwrap().clone();
     // The real state of ~/.claude/settings.json wins over whatever we stored.
     settings.hooks_installed = hooks::status().installed;
+    // Launch is always centred (see `setup`), so report that rather than the
+    // saved resting place — the front end derives the island's offset from this
+    // value and must match where the window actually is.
+    settings.notch_position = 0.5;
     let screen = island::screen_info(&app, &settings.screen);
     BootInfo {
         settings,
@@ -61,15 +69,27 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
 
 #[tauri::command]
 fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
-    let (screen_changed, autostart_changed) = {
+    let (screen_changed, autostart_changed, server_changed) = {
         let mut current = shared.settings.lock().unwrap();
         let screen_changed = current.screen != settings.screen;
         let autostart_changed = current.autostart != settings.autostart;
+        let server_changed = current.chat_via_server != settings.chat_via_server;
         *current = settings.clone();
-        (screen_changed, autostart_changed)
+        (screen_changed, autostart_changed, server_changed)
     };
     if let Err(err) = settings::save(&settings) {
         eprintln!("[coucou] could not save settings: {err}");
+    }
+    // The setting means "keep a server open for as long as the app is", so
+    // flipping it takes effect now rather than at the next launch. After the
+    // save, so the file already agrees with what we are about to do.
+    if server_changed {
+        if settings.chat_via_server {
+            let bin = settings.opencode_bin.clone();
+            opencode_server::ensure_ready(&bin);
+        } else {
+            opencode_server::stop_managed_port();
+        }
     }
     if autostart_changed {
         let manager = app.autolaunch();
@@ -80,7 +100,7 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     }
     if screen_changed {
         let collapsed = shared.gate.collapsed.load(Ordering::Relaxed);
-        island::apply_geometry(&app, &settings.screen, collapsed);
+        island::apply_geometry(&app, &settings.screen, collapsed, settings.notch_position);
     }
     // Keep the other window in step (island ⇄ settings window).
     let _ = app.emit("settings-changed", settings);
@@ -90,13 +110,21 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
 /// cursor poll; anything else → full panel and 60 Hz polling.
 #[tauri::command]
 fn set_collapsed(app: AppHandle, shared: State<Shared>, collapsed: bool) {
-    let pref = shared.settings.lock().unwrap().screen.clone();
+    let (pref, position) = {
+        let current = shared.settings.lock().unwrap();
+        (current.screen.clone(), current.notch_position)
+    };
     shared.gate.collapsed.store(collapsed, Ordering::Relaxed);
-    island::apply_geometry(&app, &pref, collapsed);
-    // The wake strip must always take the mouse, and a resize invalidates the flag.
+    island::apply_geometry(&app, &pref, collapsed, position);
+    // The reduced stub must always take the mouse, and a resize invalidates the flag.
     island::set_ignore_cursor(&app, false);
     shared.gate.forget_ignore_state();
-    shared.gate.set_active(!collapsed);
+    // The poll keeps running while reduced. It used to be parked, because the
+    // resting state was an invisible strip with nothing to see; the stub is a
+    // real, visible island now, and parking the poll left the click-through flag
+    // frozen, so a stub that drifted under the cursor could not be woken again.
+    // The window is only 80x24 here, so polling it stays cheap.
+    shared.gate.set_active(true);
 }
 
 /// The front end pushes the island shape; Rust decides click-through from it.
@@ -116,9 +144,31 @@ fn focus_window(app: AppHandle, focused: bool) {
 
 #[tauri::command]
 fn reposition(app: AppHandle, shared: State<Shared>) {
-    let pref = shared.settings.lock().unwrap().screen.clone();
+    let (pref, position) = {
+        let current = shared.settings.lock().unwrap();
+        (current.screen.clone(), current.notch_position)
+    };
     let collapsed = shared.gate.collapsed.load(Ordering::Relaxed);
-    island::apply_geometry(&app, &pref, collapsed);
+    island::apply_geometry(&app, &pref, collapsed, position);
+}
+
+/// Moves the resting island sideways without waiting for the settings window to
+/// save. Called live while the compact island is dragged, then once more to
+/// persist the final resting place.
+#[tauri::command]
+fn set_notch_position(app: AppHandle, shared: State<Shared>, position: f64) {
+    let position = if position.is_finite() { position.clamp(0.0, 1.0) } else { 0.5 };
+    let (pref, saved) = {
+        let mut current = shared.settings.lock().unwrap();
+        current.notch_position = position;
+        (current.screen.clone(), current.clone())
+    };
+    if let Err(err) = settings::save(&saved) {
+        eprintln!("[coucou] could not save settings: {err}");
+    }
+    let collapsed = shared.gate.collapsed.load(Ordering::Relaxed);
+    island::apply_geometry(&app, &pref, collapsed, position);
+    let _ = app.emit("settings-changed", saved);
 }
 
 #[tauri::command]
@@ -158,7 +208,7 @@ fn open_in_vscode(path: Option<String>) -> bool {
 /// Our own `where`: walks %PATH% against %PATHEXT%, no shell involved.
 /// Rust quotes arguments correctly for `.cmd`/`.bat` targets since 1.77, so
 /// spawning `code.cmd` directly is safe.
-fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
     let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
     let dirs = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&dirs) {
@@ -174,6 +224,9 @@ fn find_on_path(stem: &str) -> Option<std::path::PathBuf> {
 
 #[tauri::command]
 fn quit_app(app: AppHandle) {
+    // Coucou may have started an opencode server of its own; do not leave it
+    // running once the app is gone.
+    opencode_server::shutdown();
     app.exit(0);
 }
 
@@ -218,11 +271,29 @@ fn hooks_apply(
     Ok(backup)
 }
 
+// ── opencode plugin ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn opencode_status() -> OpencodeStatus {
+    opencode::status()
+}
+
+/// Returns the diff the user has to look at before anything is written.
+#[tauri::command]
+fn opencode_preview(install: bool) -> Result<OpencodePreview, String> {
+    opencode::preview(install)
+}
+
+/// Only ever called from an explicit click in the settings window.
+#[tauri::command]
+fn opencode_apply(install: bool, fingerprint: String) -> Result<String, String> {
+    opencode::write(install, &fingerprint)
+}
+
 #[tauri::command]
 fn approval_decision(app: AppHandle, request_id: String, decision: String) {
     pipe::answer(&app, &request_id, &decision);
 }
-
 /// The island has the card on screen, so the long wait for a human may begin.
 /// Until this arrives the relay only waits a few hundred milliseconds, which is
 /// what stops a paused or unresponsive island from freezing Claude Code.
@@ -241,20 +312,91 @@ fn approval_decline(app: AppHandle, request_id: String) {
 // ── Chat, files and secrets ───────────────────────────────────────────────────
 
 /// One chat turn. The API key and any file bytes stay on the Rust side.
+///
+/// Normally this follows Settings → Chat exactly. The exception is a Claude
+/// choice with no key stored: there is nothing to answer with, and the user's
+/// own opencode is right there, so the turn goes there instead of stopping on
+/// "API key missing". With neither available the original message stands, since
+/// it names the fix.
 #[tauri::command]
 async fn chat_send(
     shared: State<'_, Shared>,
     chat: State<'_, Chat>,
+    ochat: State<'_, opencode_chat::OpencodeChat>,
     query: String,
     context: Option<ChatContext>,
+    session: Option<String>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    let (provider, model, bin, omodel) = {
+        let s = shared.settings.lock().unwrap();
+        (
+            s.chat_provider.clone(),
+            s.model.clone(),
+            s.opencode_bin.clone(),
+            s.opencode_model.clone(),
+        )
+    };
+    let use_opencode = provider == "opencode"
+        || (!secrets::present("anthropic-api-key")
+            && opencode_chat::resolve_bin(&bin).is_some());
+    if use_opencode {
+        opencode_chat::send(&ochat, &bin, &omodel, query, context, session).await
+    } else {
+        claude::send(&chat, &model, query, context).await
+    }
+}
+
+/// The `/`-menu commands of the running opencode, for the chat command popup.
+/// Empty when no opencode is up — the island then hides the menu.
+#[tauri::command]
+fn opencode_commands() -> Vec<opencode_server::CommandInfo> {
+    opencode_server::commands()
+}
+
+/// Live sessions of the running opencode, newest first, for the session picker.
+#[tauri::command]
+fn opencode_sessions() -> Vec<opencode_server::SessionInfo> {
+    opencode_server::sessions()
+}
+
+/// Deletes a session. The island confirms with the user before calling this.
+#[tauri::command]
+fn opencode_delete_session(id: String) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("no session given".to_string());
+    }
+    opencode_server::delete_session(&id)
+}
+
+/// The messages of a picked session, so the chat opens on the conversation
+/// instead of an empty window.
+#[tauri::command]
+fn opencode_session_messages(id: String) -> Vec<opencode_server::HistoryMessage> {
+    opencode_server::session_messages(&id)
+}
+
+/// Base URL of the opencode server Coucou is talking to, or null when none.
+#[tauri::command]
+fn opencode_server_url() -> Option<String> {
+    opencode_server::discover(false)
 }
 
 #[tauri::command]
-fn chat_reset(chat: State<Chat>) {
+fn chat_reset(chat: State<Chat>, ochat: State<opencode_chat::OpencodeChat>) {
     chat.reset();
+    ochat.reset();
+}
+
+/// What the Settings → Chat section shows: resolved binary, key presence.
+#[tauri::command]
+fn chat_status(shared: State<Shared>) -> opencode_chat::ChatStatus {
+    let s = shared.settings.lock().unwrap();
+    opencode_chat::ChatStatus {
+        bin_configured: s.opencode_bin.clone(),
+        bin_resolved: opencode_chat::resolve_bin(&s.opencode_bin)
+            .map(|p| p.to_string_lossy().to_string()),
+        claude_key_present: secrets::present("anthropic-api-key"),
+    }
 }
 
 /// Copies a dropped file into the inbox and reports its name back.
@@ -368,6 +510,16 @@ fn open_settings_window(app: AppHandle) {
 pub fn run() {
     let loaded = settings::load();
     let gate = Arc::new(PollGate::new());
+    // "Keep a server open for as long as the app is" starts here rather than on
+    // the first message, off the main thread so binding the port never delays
+    // the window. Off means no server of our own, and any one an earlier run
+    // leaked on our port is cleared out.
+    if loaded.chat_via_server {
+        let bin = loaded.opencode_bin.clone();
+        opencode_server::ensure_ready(&bin);
+    } else {
+        opencode_server::stop_managed_port();
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -380,6 +532,7 @@ pub fn run() {
         })
         .manage(Pending::default())
         .manage(Chat::default())
+        .manage(opencode_chat::OpencodeChat::default())
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,
@@ -387,18 +540,28 @@ pub fn run() {
             set_island_rect,
             focus_window,
             reposition,
+            set_notch_position,
             open_url,
             open_in_vscode,
             quit_app,
             hooks_status,
             hooks_preview,
             hooks_apply,
+            opencode_status,
+            opencode_preview,
+            opencode_apply,
             approval_decision,
             approval_ack,
             approval_decline,
             log_line,
-            chat_send,
+chat_send,
             chat_reset,
+        chat_status,
+        opencode_commands,
+        opencode_sessions,
+    opencode_delete_session,
+    opencode_session_messages,
+        opencode_server_url,
             ingest_file,
             secret_present,
             secret_set,
@@ -415,8 +578,14 @@ pub fn run() {
             create_settings_window(&handle);
 
             if let Some(win) = island::window(&handle) {
-                island::make_non_activating(&win);
-                island::apply_geometry(&handle, &loaded.screen, false);
+island::make_non_activating(&win);
+                // Always open centred, whatever resting place was saved last time.
+                // The saved position is where the user parks the bar, not where the
+                // app should appear — surprising as that would be on launch — so the
+                // value is kept in settings and applied only once the bar is dragged.
+                let mut loaded = loaded;
+                loaded.notch_position = 0.5;
+                island::apply_geometry(&handle, &loaded.screen, false, loaded.notch_position);
                 let _ = win.show();
             }
             gate.collapsed.store(false, Ordering::Relaxed);
@@ -425,6 +594,7 @@ pub fn run() {
 
             log::line(format!("--- Coucou {} started ---", env!("CARGO_PKG_VERSION")));
             hooks::ensure_hook_exe(&handle);
+            opencode::ensure_plugin();
             pipe::start(handle.clone());
             integrations::start(handle.clone());
             Ok(())
